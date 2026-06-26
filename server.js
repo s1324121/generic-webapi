@@ -30,12 +30,63 @@ try {
 
 const OPENAI_API_ENDPOINT = 'https://api.openai.com/v1/chat/completions';
 const GEMINI_API_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
+const NEWS_FEEDS = {
+    product: '"AI product" OR "生成AI" OR "artificial intelligence product" when:14d',
+    research: '"AI research" OR "machine learning research" when:14d',
+    business: '"AI startup" OR "AI investment" OR "AI business" when:14d',
+    policy: '"AI regulation" OR "AI policy" OR "AI safety" when:30d',
+};
+const NEWS_CATEGORY_LABELS = {
+    product: 'プロダクト',
+    research: '研究',
+    business: 'ビジネス',
+    policy: '政策',
+};
 
 // public/ 内の .html 一覧を返す（index.html がこの一覧を使ってリンクを表示する）
 app.get('/api/pages', (req, res) => {
     const files = fs.readdirSync('public')
         .filter(name => name.endsWith('.html') && name !== 'index.html');
     res.json(files);
+});
+
+app.get('/api/news', async (req, res) => {
+    try {
+        const category = String(req.query.category || 'all');
+        const articles = category === 'all'
+            ? (await Promise.all(Object.keys(NEWS_FEEDS).map(fetchNewsByCategory))).flat()
+            : await fetchNewsByCategory(NEWS_FEEDS[category] ? category : 'product');
+
+        res.json({
+            category: category === 'all' || NEWS_FEEDS[category] ? category : 'product',
+            updatedAt: new Date().toISOString(),
+            articles,
+        });
+    } catch (error) {
+        console.error('News API Error:', error);
+        res.status(500).json({ error: 'Failed to fetch AI news. Please try again.' });
+    }
+});
+
+app.get('/api/reviews', async (req, res) => {
+    try {
+        const courseName = String(req.query.courseName || '').trim();
+        const schoolName = String(req.query.schoolName || '').trim();
+
+        if (!courseName) {
+            return res.status(400).json({ error: 'courseName is required' });
+        }
+
+        const reviews = await searchCourseReviews(courseName, schoolName);
+        res.json({
+            courseName,
+            schoolName,
+            reviews,
+        });
+    } catch (error) {
+        console.error('Review Search Error:', error);
+        res.status(500).json({ error: 'Failed to search course reviews. Please paste reviews manually.' });
+    }
 });
 
 // 問題数の上限（過剰なリクエストでトークンを浪費しないようにする）
@@ -72,6 +123,7 @@ app.post('/api/', async (req, res) => {
         res.json({
             title: title,
             data: result,
+            rawData: JSON.stringify(result),
         });
 
     } catch (error) {
@@ -168,6 +220,206 @@ function extractArray(responseText) {
         throw new Error('No array found in the LLM response object.');
     }
     return arrayData;
+}
+
+async function fetchNewsByCategory(category) {
+    const articles = await fetchNews(NEWS_FEEDS[category]);
+    return articles.slice(0, 8).map(article => ({
+        ...article,
+        category,
+        categoryLabel: NEWS_CATEGORY_LABELS[category],
+    }));
+}
+
+async function searchCourseReviews(courseName, schoolName) {
+    const terms = [
+        schoolName,
+        courseName,
+        '講義',
+        '口コミ',
+        '授業評価',
+        'シラバス',
+    ].filter(Boolean).join(' ');
+
+    const url = new URL('https://html.duckduckgo.com/html/');
+    url.searchParams.set('q', terms);
+
+    const response = await fetch(url, {
+        headers: {
+            'User-Agent': 'generic-webapi-course-review/1.0',
+        },
+    });
+
+    if (!response.ok) {
+        throw new Error(`Review search failed: ${response.status}`);
+    }
+
+    const html = await response.text();
+    const results = parseSearchResults(html).slice(0, 5);
+    return Promise.all(results.map((result, index) => {
+        return index < 3 ? enrichSearchResult(result) : result;
+    }));
+}
+
+async function enrichSearchResult(result) {
+    if (result.snippet && result.snippet.length > 80) {
+        return result;
+    }
+
+    const pageText = await fetchPageSummary(result.link);
+    return {
+        ...result,
+        snippet: pageText || result.snippet,
+    };
+}
+
+async function fetchPageSummary(link) {
+    try {
+        const response = await fetch(link, {
+            headers: {
+                'User-Agent': 'generic-webapi-course-review/1.0',
+            },
+            signal: AbortSignal.timeout(5000),
+        });
+
+        if (!response.ok) {
+            return '';
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
+            return '';
+        }
+
+        const html = await response.text();
+        return stripHtml(decodeXml(html
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')))
+            .slice(0, 900);
+    } catch (error) {
+        return '';
+    }
+}
+
+function parseSearchResults(html) {
+    const blocks = html.match(/<div class="result[\s\S]*?(?=<div class="result|\s*<\/body>)/g) || [];
+
+    return blocks.map((block) => {
+        const titleMatch = block.match(/class="result__a" href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+        const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/)
+            || block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/div>/);
+
+        if (!titleMatch) {
+            return null;
+        }
+
+        const link = normalizeSearchUrl(decodeXml(titleMatch[1]));
+        const title = stripHtml(decodeXml(titleMatch[2]));
+        const snippet = snippetMatch ? stripHtml(decodeXml(snippetMatch[1])) : '';
+
+        return {
+            title,
+            snippet,
+            link,
+        };
+    }).filter(result => result && result.title && result.link);
+}
+
+function normalizeSearchUrl(value) {
+    const withProtocol = value.startsWith('//') ? `https:${value}` : value;
+
+    try {
+        const url = new URL(withProtocol);
+        const redirected = url.searchParams.get('uddg');
+        return redirected ? decodeURIComponent(redirected) : withProtocol;
+    } catch (error) {
+        return withProtocol;
+    }
+}
+
+async function fetchNews(query) {
+    const url = new URL('https://news.google.com/rss/search');
+    url.searchParams.set('q', query);
+    url.searchParams.set('hl', 'ja');
+    url.searchParams.set('gl', 'JP');
+    url.searchParams.set('ceid', 'JP:ja');
+
+    const response = await fetch(url, {
+        headers: {
+            'User-Agent': 'generic-webapi-ai-news/1.0',
+        },
+    });
+
+    if (!response.ok) {
+        throw new Error(`News feed request failed: ${response.status}`);
+    }
+
+    const xml = await response.text();
+    return parseNewsItems(xml).slice(0, 18);
+}
+
+function parseNewsItems(xml) {
+    const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
+
+    return itemMatches.map((item) => {
+        const title = decodeXml(getXmlValue(item, 'title'));
+        const link = decodeXml(getXmlValue(item, 'link'));
+        const source = decodeXml(getXmlValue(item, 'source'));
+        const sourceUrl = decodeXml(getXmlAttribute(item, 'source', 'url'));
+        const pubDate = parsePublishedAt(getXmlValue(item, 'pubDate'));
+        const description = stripHtml(decodeXml(getXmlValue(item, 'description')));
+
+        return {
+            title,
+            link,
+            source: source || 'Google News',
+            sourceUrl,
+            publishedAt: pubDate,
+            summary: description,
+        };
+    }).filter(article => article.title && article.link);
+}
+
+function parsePublishedAt(value) {
+    if (!value) {
+        return null;
+    }
+
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function getXmlValue(xml, tagName) {
+    const match = xml.match(new RegExp(`<${tagName}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tagName}>`));
+    return match ? match[1].trim() : '';
+}
+
+function getXmlAttribute(xml, tagName, attributeName) {
+    const tagMatch = xml.match(new RegExp(`<${tagName}\\s+([^>]*)>`));
+    if (!tagMatch) {
+        return '';
+    }
+
+    const attributeMatch = tagMatch[1].match(new RegExp(`${attributeName}="([^"]*)"`));
+    return attributeMatch ? attributeMatch[1].trim() : '';
+}
+
+function stripHtml(value) {
+    return value
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function decodeXml(value) {
+    return value
+        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)));
 }
 
 app.listen(PORT, () => {
